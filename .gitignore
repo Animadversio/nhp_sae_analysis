@@ -1,0 +1,22 @@
+# Data and cache
+cache/
+results/
+*.pkl
+*.npy
+*.mat
+*.h5
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Figures
+*.png
+*.pdf
+*.svg
+
+# Logs and temp
+*.log
+nohup.out
