@@ -131,13 +131,79 @@ class MatryoshkaBatchTopKSAE(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Matryoshka cumulative reconstruction loss (from temporal-saes design)
+# ---------------------------------------------------------------------------
+
+def _matryoshka_recon_loss(
+    ae: "MatryoshkaBatchTopKSAE",
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Cumulative Matryoshka reconstruction loss following the temporal-saes design.
+
+    For each group prefix g=1..n_groups, applies batch top-(k*g//n_groups)
+    restricted to the first g groups' dictionary entries, decodes, and computes
+    MSE.  The total loss is the mean over all group levels.
+
+    This matches the training scheme of TemporalMatryoshkaBatchTopKTrainer in
+    temporal-saes, where earlier groups receive more gradient signal because
+    they participate in more cumulative losses.
+
+    Parameters
+    ----------
+    ae : MatryoshkaBatchTopKSAE
+    x  : [B, D] input activations (already on the correct device)
+
+    Returns
+    -------
+    Scalar tensor: mean cumulative reconstruction loss
+    """
+    B = x.size(0)
+    k = int(ae.k.item())
+    n_groups = ae.active_groups
+    group_indices = ae.group_indices  # [0, g1, g2, ..., dict_size]
+
+    # Compute pre-ReLU encoder activations once
+    post_relu = F.relu((x - ae.b_dec) @ ae.W_enc + ae.b_enc)  # [B, dict_size]
+
+    total_loss = torch.tensor(0.0, device=x.device)
+
+    for g in range(n_groups):
+        end = group_indices[g + 1]          # prefix length for this group level
+        k_g = max(1, k * (g + 1) // n_groups)  # proportional batch top-k
+
+        # Batch top-k within the first `end` features
+        slice_ = post_relu[:, :end].contiguous()          # [B, end]
+        flat = slice_.flatten()                            # [B*end]
+        topk = flat.topk(k_g * B, sorted=False)
+        f_g = torch.zeros(B, ae.dict_size, device=x.device)
+        f_g[:, :end] = (
+            torch.zeros_like(flat)
+            .scatter_(-1, topk.indices, topk.values)
+            .view(B, end)
+        )
+
+        x_hat_g = ae.decode(f_g)
+        total_loss = total_loss + F.mse_loss(x_hat_g, x)
+
+    return total_loss / n_groups  # normalise so magnitude matches single-MSE
+
+
+# ---------------------------------------------------------------------------
 # SpatialPatchTopKTrainer  (from spatial_patch_top_k.py)
 # ---------------------------------------------------------------------------
 
 class SpatialPatchTopKTrainer:
     """
-    Trains MatryoshkaBatchTopKSAE with reconstruction + spatial contrastive loss
-    on adjacent patch pairs. Source: spatial_patch_top_k.py
+    Trains MatryoshkaBatchTopKSAE with cumulative Matryoshka reconstruction loss
+    + spatial InfoNCE contrastive loss on adjacent patch pairs.
+
+    Follows the temporal-saes design:
+      - Reconstruction: cumulative MSE at each Matryoshka group boundary
+        (earlier groups receive more gradient signal — the nesting property)
+      - Contrastive: HL-only (first dict_size//2 features), matching
+        spatial_patch_top_k.py in T-SAE-Follow-Up
+      - Encoder uses batch top-k (use_threshold=False) during training
     """
 
     def __init__(self, ae: MatryoshkaBatchTopKSAE, lr: float = 3e-4,
@@ -148,6 +214,7 @@ class SpatialPatchTopKTrainer:
         self.recon_alpha = recon_alpha
         self.contrastive_alpha = contrastive_alpha
         self.temperature = temperature
+        self.hl_split = ae.dict_size // 2  # always HL-only, matching T-SAE design
         self.opt = torch.optim.Adam(ae.parameters(), lr=lr)
 
     def step(self, x: torch.Tensor) -> dict:
@@ -155,15 +222,17 @@ class SpatialPatchTopKTrainer:
         x = x.to(self.device)
         x0, x1 = x[:, 0], x[:, 1]
 
-        f0 = self.ae.encode(x0)
-        f1 = self.ae.encode(x1)
-        x0_hat = self.ae.decode(f0)
-        x1_hat = self.ae.decode(f1)
+        # Cumulative Matryoshka reconstruction loss (temporal-saes design)
+        recon_loss = _matryoshka_recon_loss(self.ae, x0) + \
+                     _matryoshka_recon_loss(self.ae, x1)
 
-        recon_loss = F.mse_loss(x0_hat, x0) + F.mse_loss(x1_hat, x1)
+        # Encode for contrastive loss (batch top-k, no threshold)
+        f0 = self.ae.encode(x0, use_threshold=False)
+        f1 = self.ae.encode(x1, use_threshold=False)
 
-        z0 = F.normalize(f0, dim=-1)
-        z1 = F.normalize(f1, dim=-1)
+        # Contrastive loss on HL features only (first dict_size//2)
+        z0 = F.normalize(f0[:, :self.hl_split], dim=-1)
+        z1 = F.normalize(f1[:, :self.hl_split], dim=-1)
         logits = (z0 @ z1.T) / self.temperature
         labels = torch.arange(logits.size(0), device=logits.device)
         contrastive_loss = 0.5 * (
@@ -176,7 +245,7 @@ class SpatialPatchTopKTrainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
 
-        # keep decoder unit-norm
+        # keep decoder unit-norm (from temporal-saes)
         self.ae.W_dec.grad = _remove_gradient_parallel_to_decoder_directions(
             self.ae.W_dec.T, self.ae.W_dec.grad.T,
             self.ae.activation_dim, self.ae.dict_size
@@ -197,9 +266,14 @@ class SpatialPatchTopKTrainer:
 
 class MultiScaleSpatialTrainer:
     """
-    Trains MatryoshkaBatchTopKSAE with reconstruction + multi-scale spatial
-    contrastive loss.  Input x: [B, S+1, D] where dim1 = [anchor, s1_nbr, ...].
-    Each scale gets its own temperature and loss weight.
+    Trains MatryoshkaBatchTopKSAE with cumulative Matryoshka reconstruction loss
+    + multi-scale spatial InfoNCE on HL features.
+
+    Follows the temporal-saes + T-SAE-Follow-Up design:
+      - Reconstruction: cumulative MSE at each Matryoshka group boundary
+      - Contrastive: HL-only (first dict_size//2), applied at each scale
+        with individual temperatures and weights
+      - Encoder uses batch top-k (use_threshold=False) during training
     """
 
     def __init__(
@@ -220,7 +294,6 @@ class MultiScaleSpatialTrainer:
         self.contrastive_alpha = contrastive_alpha
 
         S = len(scales)
-        # Normalize scale_weights to sum to 1; total contrastive weight = contrastive_alpha
         raw_weights = scale_weights if scale_weights is not None else [1.0] * S
         total = sum(raw_weights)
         self.scale_weights = [w / total for w in raw_weights]
@@ -230,7 +303,7 @@ class MultiScaleSpatialTrainer:
         assert len(self.scale_weights) == S
         assert len(self.scale_temperatures) == S
 
-        # Contrastive loss applied only to high-level group (first dict_size//2 features)
+        # Contrastive loss on HL features only (first dict_size//2)
         self.hl_split = ae.dict_size // 2
 
         self.opt = torch.optim.Adam(ae.parameters(), lr=lr)
@@ -240,24 +313,25 @@ class MultiScaleSpatialTrainer:
         x = x.to(self.device)
         B, S_plus_1, D = x.shape
 
-        # Reconstruction loss: encode+decode all tokens together (efficient)
+        # Cumulative Matryoshka reconstruction loss on all tokens
+        # Process each token position separately through the cumulative loss
         x_flat = x.view(B * S_plus_1, D)
-        f_flat = self.ae.encode(x_flat)                       # [B*(S+1), dict_size]
-        x_hat = self.ae.decode(f_flat)
-        recon_loss = F.mse_loss(x_hat, x_flat)
+        recon_loss = _matryoshka_recon_loss(self.ae, x_flat)
 
-        # Reshape for contrastive loss
+        # Encode all tokens with batch top-k for contrastive loss
+        f_flat = self.ae.encode(x_flat, use_threshold=False)  # [B*(S+1), dict_size]
         f_all = f_flat.view(B, S_plus_1, -1)                  # [B, S+1, dict_size]
+
+        # Multi-scale contrastive losses on HL features only
         f_anchor_hl = f_all[:, 0, :self.hl_split]             # [B, hl_split]
         z_anchor = F.normalize(f_anchor_hl, dim=-1)
 
-        # Multi-scale contrastive losses on high-level features only
         contrastive_loss = torch.tensor(0.0, device=self.device)
         S = len(self.scales)
         for s in range(S):
             if s + 1 >= S_plus_1:
                 break
-            f_nbr_hl = f_all[:, s + 1, :self.hl_split]       # [B, hl_split]
+            f_nbr_hl = f_all[:, s + 1, :self.hl_split]
             z_nbr = F.normalize(f_nbr_hl, dim=-1)
 
             temp = self.scale_temperatures[s]
@@ -273,6 +347,7 @@ class MultiScaleSpatialTrainer:
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
 
+        # Decoder norm + gradient projection (from temporal-saes)
         self.ae.W_dec.grad = _remove_gradient_parallel_to_decoder_directions(
             self.ae.W_dec.T, self.ae.W_dec.grad.T,
             self.ae.activation_dim, self.ae.dict_size
@@ -434,9 +509,12 @@ def train_spatial_sae(
     k               : batch top-k sparsity
     group_fractions : Matryoshka group fractions (default [0.25]*4)
     scales          : Chebyshev distances for multi-scale loss (default [1,2,4]).
-                      Set to None or [1] to use single-scale (original behavior).
+                      Pass [1] to use single-scale.
     scale_weights   : per-scale loss weights (default [1.0, 0.5, 0.2])
     scale_temperatures : per-scale InfoNCE temperature (default [0.1, 0.15, 0.2])
+
+    Both trainers use cumulative Matryoshka reconstruction losses (temporal-saes
+    design) and apply contrastive loss on HL features only (first dict_size//2).
 
     Returns
     -------
