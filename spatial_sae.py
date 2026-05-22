@@ -220,37 +220,45 @@ class MultiScaleSpatialTrainer:
         self.contrastive_alpha = contrastive_alpha
 
         S = len(scales)
-        self.scale_weights = scale_weights if scale_weights is not None else [1.0] * S
+        # Normalize scale_weights to sum to 1; total contrastive weight = contrastive_alpha
+        raw_weights = scale_weights if scale_weights is not None else [1.0] * S
+        total = sum(raw_weights)
+        self.scale_weights = [w / total for w in raw_weights]
         self.scale_temperatures = (
             scale_temperatures if scale_temperatures is not None else [0.1] * S
         )
         assert len(self.scale_weights) == S
         assert len(self.scale_temperatures) == S
 
+        # Contrastive loss applied only to high-level group (first dict_size//2 features)
+        self.hl_split = ae.dict_size // 2
+
         self.opt = torch.optim.Adam(ae.parameters(), lr=lr)
 
     def step(self, x: torch.Tensor) -> dict:
         """x: [B, S+1, D]  —  x[:,0]=anchor, x[:,1..]=scale neighbors"""
         x = x.to(self.device)
-        anchor = x[:, 0]  # [B, D]
+        B, S_plus_1, D = x.shape
 
-        # Encode anchor + all neighbors once
-        S = len(self.scales)
-        f_anchor = self.ae.encode(anchor)
-        f_nbrs = [self.ae.encode(x[:, s + 1]) for s in range(S)]
+        # Reconstruction loss: encode+decode all tokens together (efficient)
+        x_flat = x.view(B * S_plus_1, D)
+        f_flat = self.ae.encode(x_flat)                       # [B*(S+1), dict_size]
+        x_hat = self.ae.decode(f_flat)
+        recon_loss = F.mse_loss(x_hat, x_flat)
 
-        # Reconstruction loss
-        recon_loss = F.mse_loss(self.ae.decode(f_anchor), anchor)
-        for s in range(S):
-            recon_loss = recon_loss + F.mse_loss(self.ae.decode(f_nbrs[s]), x[:, s + 1])
-        recon_loss = recon_loss / (S + 1)
+        # Reshape for contrastive loss
+        f_all = f_flat.view(B, S_plus_1, -1)                  # [B, S+1, dict_size]
+        f_anchor_hl = f_all[:, 0, :self.hl_split]             # [B, hl_split]
+        z_anchor = F.normalize(f_anchor_hl, dim=-1)
 
-        # Multi-scale contrastive losses
-        z_anchor = F.normalize(f_anchor, dim=-1)
+        # Multi-scale contrastive losses on high-level features only
         contrastive_loss = torch.tensor(0.0, device=self.device)
+        S = len(self.scales)
         for s in range(S):
-            f_nbr = f_nbrs[s]
-            z_nbr = F.normalize(f_nbr, dim=-1)
+            if s + 1 >= S_plus_1:
+                break
+            f_nbr_hl = f_all[:, s + 1, :self.hl_split]       # [B, hl_split]
+            z_nbr = F.normalize(f_nbr_hl, dim=-1)
 
             temp = self.scale_temperatures[s]
             logits = (z_anchor @ z_nbr.T) / temp
