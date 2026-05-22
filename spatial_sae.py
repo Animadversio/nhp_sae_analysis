@@ -195,6 +195,94 @@ class SpatialPatchTopKTrainer:
         }
 
 
+class MultiScaleSpatialTrainer:
+    """
+    Trains MatryoshkaBatchTopKSAE with reconstruction + multi-scale spatial
+    contrastive loss.  Input x: [B, S+1, D] where dim1 = [anchor, s1_nbr, ...].
+    Each scale gets its own temperature and loss weight.
+    """
+
+    def __init__(
+        self,
+        ae: MatryoshkaBatchTopKSAE,
+        scales: list[int] = [1, 2, 4],
+        scale_weights: Optional[list[float]] = None,
+        scale_temperatures: Optional[list[float]] = None,
+        lr: float = 3e-4,
+        recon_alpha: float = 1.0,
+        contrastive_alpha: float = 5.0,
+        device: str = "cuda",
+    ):
+        self.ae = ae.to(device)
+        self.device = device
+        self.scales = scales
+        self.recon_alpha = recon_alpha
+        self.contrastive_alpha = contrastive_alpha
+
+        S = len(scales)
+        self.scale_weights = scale_weights if scale_weights is not None else [1.0] * S
+        self.scale_temperatures = (
+            scale_temperatures if scale_temperatures is not None else [0.1] * S
+        )
+        assert len(self.scale_weights) == S
+        assert len(self.scale_temperatures) == S
+
+        self.opt = torch.optim.Adam(ae.parameters(), lr=lr)
+
+    def step(self, x: torch.Tensor) -> dict:
+        """x: [B, S+1, D]  —  x[:,0]=anchor, x[:,1..]=scale neighbors"""
+        x = x.to(self.device)
+        anchor = x[:, 0]  # [B, D]
+
+        # Encode anchor + all neighbors once
+        S = len(self.scales)
+        f_anchor = self.ae.encode(anchor)
+        f_nbrs = [self.ae.encode(x[:, s + 1]) for s in range(S)]
+
+        # Reconstruction loss
+        recon_loss = F.mse_loss(self.ae.decode(f_anchor), anchor)
+        for s in range(S):
+            recon_loss = recon_loss + F.mse_loss(self.ae.decode(f_nbrs[s]), x[:, s + 1])
+        recon_loss = recon_loss / (S + 1)
+
+        # Multi-scale contrastive losses
+        z_anchor = F.normalize(f_anchor, dim=-1)
+        contrastive_loss = torch.tensor(0.0, device=self.device)
+        for s in range(S):
+            f_nbr = f_nbrs[s]
+            z_nbr = F.normalize(f_nbr, dim=-1)
+
+            temp = self.scale_temperatures[s]
+            logits = (z_anchor @ z_nbr.T) / temp
+            labels = torch.arange(logits.size(0), device=self.device)
+            loss_s = 0.5 * (
+                F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+            )
+            contrastive_loss = contrastive_loss + self.scale_weights[s] * loss_s
+
+        loss = self.recon_alpha * recon_loss + self.contrastive_alpha * contrastive_loss
+
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+
+        self.ae.W_dec.grad = _remove_gradient_parallel_to_decoder_directions(
+            self.ae.W_dec.T, self.ae.W_dec.grad.T,
+            self.ae.activation_dim, self.ae.dict_size
+        ).T
+        torch.nn.utils.clip_grad_norm_(self.ae.parameters(), 1.0)
+        self.opt.step()
+
+        self.ae.W_dec.data = _set_decoder_norm_to_unit_norm(
+            self.ae.W_dec.T, self.ae.activation_dim, self.ae.dict_size
+        ).T
+
+        return {
+            "loss": loss.item(),
+            "recon_loss": recon_loss.item(),
+            "contrastive_loss": contrastive_loss.item(),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Spatial patch pair generation from pre-extracted tokens
 # ---------------------------------------------------------------------------
@@ -206,6 +294,36 @@ def _grid_neighbors(side: int, r: int, c: int, mode: str = "8") -> list[tuple[in
     return [(r + dr, c + dc)
             for dr, dc in deltas
             if 0 <= r + dr < side and 0 <= c + dc < side]
+
+
+def _patches_at_chebyshev_distance(
+    h: int, w: int, r: int, c: int, d: int
+) -> list[tuple[int, int]]:
+    """Return all patches at exactly Chebyshev distance d from (r, c)."""
+    neighbors = []
+    for dr in range(-d, d + 1):
+        for dc in range(-d, d + 1):
+            if max(abs(dr), abs(dc)) != d:
+                continue
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < h and 0 <= cc < w:
+                neighbors.append((rr, cc))
+    return neighbors
+
+
+def _patches_within_chebyshev_distance(
+    h: int, w: int, r: int, c: int, d: int
+) -> list[tuple[int, int]]:
+    """Fallback: return all patches within Chebyshev distance d (excluding self)."""
+    neighbors = []
+    for dr in range(-d, d + 1):
+        for dc in range(-d, d + 1):
+            if dr == 0 and dc == 0:
+                continue
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < h and 0 <= cc < w:
+                neighbors.append((rr, cc))
+    return neighbors
 
 
 def _sample_patch_pairs(patch_tokens: torch.Tensor, pairs_per_image: int = 32,
@@ -232,6 +350,47 @@ def _sample_patch_pairs(patch_tokens: torch.Tensor, pairs_per_image: int = 32,
     return torch.stack(pairs, dim=0) if pairs else torch.empty(0, 2, D)
 
 
+def _sample_multiscale_patch_pairs(
+    patch_tokens: torch.Tensor,
+    scales: list[int],
+    pairs_per_image: int = 32,
+) -> torch.Tensor:
+    """
+    patch_tokens: (B, N, D)
+    Returns (B * pairs_per_image, S+1, D) where dim1 = [anchor, scale1_nbr, scale2_nbr, ...]
+    """
+    bsz, n_patches, D = patch_tokens.shape
+    side = int(math.sqrt(n_patches))
+    assert side * side == n_patches, f"Expected square grid, got {n_patches} patches"
+
+    S = len(scales)
+    grid = patch_tokens.view(bsz, side, side, D)
+    samples = []
+    for b in range(bsz):
+        for _ in range(pairs_per_image):
+            r = random.randrange(side)
+            c = random.randrange(side)
+            anchor = grid[b, r, c]
+
+            neighbors = []
+            valid = True
+            for d in scales:
+                nbrs = _patches_at_chebyshev_distance(side, side, r, c, d)
+                if not nbrs:
+                    nbrs = _patches_within_chebyshev_distance(side, side, r, c, d)
+                if not nbrs:
+                    valid = False
+                    break
+                rr, cc = random.choice(nbrs)
+                neighbors.append(grid[b, rr, cc])
+
+            if not valid:
+                continue
+            samples.append(torch.stack([anchor] + neighbors, dim=0))  # (S+1, D)
+
+    return torch.stack(samples, dim=0) if samples else torch.empty(0, S + 1, D)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -249,6 +408,9 @@ def train_spatial_sae(
     batch_images: int = 32,
     pairs_per_image: int = 16,
     neighbor_mode: str = "8",
+    scales: Optional[list[int]] = None,
+    scale_weights: Optional[list[float]] = None,
+    scale_temperatures: Optional[list[float]] = None,
     device: str = "cuda",
     verbose: bool = True,
 ) -> MatryoshkaBatchTopKSAE:
@@ -258,12 +420,15 @@ def train_spatial_sae(
 
     Parameters
     ----------
-    patch_tokens : (N_images, N_patches, D_feat)  float32 array
-    n_steps      : number of gradient steps
-    dict_size    : SAE dictionary size
-    k            : batch top-k sparsity
+    patch_tokens    : (N_images, N_patches, D_feat)  float32 array
+    n_steps         : number of gradient steps
+    dict_size       : SAE dictionary size
+    k               : batch top-k sparsity
     group_fractions : Matryoshka group fractions (default [0.25]*4)
-    ...
+    scales          : Chebyshev distances for multi-scale loss (default [1,2,4]).
+                      Set to None or [1] to use single-scale (original behavior).
+    scale_weights   : per-scale loss weights (default [1.0, 0.5, 0.2])
+    scale_temperatures : per-scale InfoNCE temperature (default [0.1, 0.15, 0.2])
 
     Returns
     -------
@@ -272,6 +437,14 @@ def train_spatial_sae(
     if group_fractions is None:
         group_fractions = [0.25, 0.25, 0.25, 0.25]
     assert abs(sum(group_fractions) - 1.0) < 1e-5
+
+    # Multi-scale defaults (Wendy's settings)
+    if scales is None:
+        scales = [1, 2, 4]
+    if scale_weights is None:
+        scale_weights = [1.0, 0.5, 0.2] if len(scales) == 3 else [1.0] * len(scales)
+    if scale_temperatures is None:
+        scale_temperatures = [0.1, 0.15, 0.2] if len(scales) == 3 else [temperature] * len(scales)
 
     group_sizes = [int(f * dict_size) for f in group_fractions[:-1]]
     group_sizes.append(dict_size - sum(group_sizes))
@@ -283,11 +456,19 @@ def train_spatial_sae(
         activation_dim=D, dict_size=dict_size, k=k, group_sizes=group_sizes
     ).to(device)
 
-    trainer = SpatialPatchTopKTrainer(
-        ae=ae, lr=lr, recon_alpha=recon_alpha,
-        contrastive_alpha=contrastive_alpha,
-        temperature=temperature, device=device,
-    )
+    if len(scales) > 1 or scales[0] != 1:
+        trainer = MultiScaleSpatialTrainer(
+            ae=ae, scales=scales, scale_weights=scale_weights,
+            scale_temperatures=scale_temperatures,
+            lr=lr, recon_alpha=recon_alpha,
+            contrastive_alpha=contrastive_alpha, device=device,
+        )
+    else:
+        trainer = SpatialPatchTopKTrainer(
+            ae=ae, lr=lr, recon_alpha=recon_alpha,
+            contrastive_alpha=contrastive_alpha,
+            temperature=scale_temperatures[0], device=device,
+        )
 
     indices = list(range(N))
     step = 0
@@ -302,8 +483,15 @@ def train_spatial_sae(
             if not batch_idx:
                 continue
             batch = tokens_t[batch_idx]  # (b, N_patches, D)
-            pairs = _sample_patch_pairs(batch, pairs_per_image=pairs_per_image,
-                                         neighbor_mode=neighbor_mode)
+
+            if isinstance(trainer, MultiScaleSpatialTrainer):
+                pairs = _sample_multiscale_patch_pairs(
+                    batch, scales=scales, pairs_per_image=pairs_per_image
+                )
+            else:
+                pairs = _sample_patch_pairs(batch, pairs_per_image=pairs_per_image,
+                                             neighbor_mode=neighbor_mode)
+
             if pairs.shape[0] == 0:
                 continue
             losses = trainer.step(pairs)
