@@ -139,54 +139,49 @@ def _matryoshka_recon_loss(
     x: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Cumulative Matryoshka reconstruction loss following the temporal-saes design.
+    Cumulative Matryoshka reconstruction loss — exact temporal-saes design.
 
-    For each group prefix g=1..n_groups, applies batch top-(k*g//n_groups)
-    restricted to the first g groups' dictionary entries, decodes, and computes
-    MSE.  The total loss is the mean over all group levels.
+    From MatryoshkaBatchTopKTrainer.loss() in AI4LIFE-GROUP/temporal-saes:
 
-    This matches the training scheme of TemporalMatryoshkaBatchTopKTrainer in
-    temporal-saes, where earlier groups receive more gradient signal because
-    they participate in more cumulative losses.
+      1. Encode ONCE with full-dict batch top-k (use_threshold=False).
+      2. Split features and W_dec into per-group chunks.
+      3. Cumulatively add each group's contribution to the reconstruction.
+      4. Compute sum-of-squares loss at each cumulative level.
+      5. Return mean over group losses (equal weights = 1/n_groups each).
+
+    This encourages importance ordering: group 0 features must reconstruct
+    most of the input on their own; later groups add residual corrections —
+    using the SAME latent codes at all levels.
 
     Parameters
     ----------
     ae : MatryoshkaBatchTopKSAE
-    x  : [B, D] input activations (already on the correct device)
+    x  : [B, D] input activations (on the correct device)
 
     Returns
     -------
     Scalar tensor: mean cumulative reconstruction loss
     """
-    B = x.size(0)
-    k = int(ae.k.item())
     n_groups = ae.active_groups
-    group_indices = ae.group_indices  # [0, g1, g2, ..., dict_size]
+    group_sizes = ae.group_sizes.tolist()[:n_groups]
 
-    # Compute pre-ReLU encoder activations once
-    post_relu = F.relu((x - ae.b_dec) @ ae.W_enc + ae.b_enc)  # [B, dict_size]
+    # Single full-dict encode
+    f = ae.encode(x, use_threshold=False)          # [B, dict_size]
 
-    total_loss = torch.tensor(0.0, device=x.device)
+    # Split f and W_dec into per-group chunks
+    W_dec_chunks = torch.split(ae.W_dec, group_sizes, dim=0)  # list of [gs, D]
+    f_chunks = torch.split(f, group_sizes, dim=1)             # list of [B, gs]
 
-    for g in range(n_groups):
-        end = group_indices[g + 1]          # prefix length for this group level
-        k_g = max(1, k * (g + 1) // n_groups)  # proportional batch top-k
+    x_reconstruct = torch.zeros_like(x) + ae.b_dec            # start from bias
+    group_losses = []
 
-        # Batch top-k within the first `end` features
-        slice_ = post_relu[:, :end].contiguous()          # [B, end]
-        flat = slice_.flatten()                            # [B*end]
-        topk = flat.topk(k_g * B, sorted=False)
-        f_g = torch.zeros(B, ae.dict_size, device=x.device)
-        f_g[:, :end] = (
-            torch.zeros_like(flat)
-            .scatter_(-1, topk.indices, topk.values)
-            .view(B, end)
-        )
+    for i in range(n_groups):
+        x_reconstruct = x_reconstruct + f_chunks[i] @ W_dec_chunks[i]
+        # temporal-saes uses sum-over-dims then batch-mean (not F.mse_loss)
+        l2_loss = (x - x_reconstruct).pow(2).sum(dim=-1).mean()
+        group_losses.append(l2_loss)
 
-        x_hat_g = ae.decode(f_g)
-        total_loss = total_loss + F.mse_loss(x_hat_g, x)
-
-    return total_loss / n_groups  # normalise so magnitude matches single-MSE
+    return torch.stack(group_losses).mean()
 
 
 # ---------------------------------------------------------------------------
