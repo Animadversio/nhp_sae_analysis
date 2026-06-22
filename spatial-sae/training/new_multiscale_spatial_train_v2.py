@@ -36,6 +36,7 @@ InfoNCE losses:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -56,6 +57,7 @@ for p in [SCRIPTS_DIR, REPO_ROOT, REPO_ROOT / "temporal-saes" / "dictionary_lear
 from new_vision_patch_pairs import (  # noqa: E402
     DINOFeatureExtractor,
     ImagePathDataset,
+    NSDHdf5Dataset,
     ParquetImageDataset,
 )
 from dictionary_learning.trainers.temporal_sequence_top_k import (  # noqa: E402
@@ -114,6 +116,8 @@ class MultiscalePatchPairBufferV2:
     def __init__(
         self,
         parquet_path: Optional[Union[str, Path]] = None,
+        hdf5_path: Optional[Union[str, Path]] = None,
+        hdf5_key: str = "imgBrick",
         image_paths: Optional[Sequence[Union[str, Path]]] = None,
         image_column: str = "image",
         dino_model_name: str = "dinov2_vitb14",
@@ -141,10 +145,13 @@ class MultiscalePatchPairBufferV2:
         if parquet_path is not None:
             dataset = ParquetImageDataset(parquet_path, image_size=image_size,
                                            image_column=image_column)
+        elif hdf5_path is not None:
+            dataset = NSDHdf5Dataset(hdf5_path, image_size=image_size, key=hdf5_key)
+            print(f"[BufferV2] Using NSD HDF5 dataset: {hdf5_path} ({len(dataset)} images)")
         elif image_paths is not None:
             dataset = ImagePathDataset(image_paths, image_size=image_size)
         else:
-            raise ValueError("Provide either parquet_path or image_paths.")
+            raise ValueError("Provide either parquet_path, hdf5_path, or image_paths.")
 
         self.loader = DataLoader(
             dataset,
@@ -348,6 +355,17 @@ class MultiscaleSpatialTrainerV2(TemporalMatryoshkaBatchTopKTrainer):
         self.num_tokens_since_fired += num_tokens
         self.num_tokens_since_fired[did_fire] = 0
 
+        # Always store latest per-group losses for external CSV logging
+        self._last_per_group_losses = {
+            "l2_loss":          total_l2.item(),
+            "loss_g0":          loss_g0.item(),
+            "loss_g1":          loss_g1.item(),
+            "loss_g2":          loss_g2.item(),
+            "contrastive_loss": contrastive.item(),
+            "auxk_loss":        auxk_loss.item(),
+            "loss":             loss.item(),
+        }
+
         if not logging:
             return loss
         from collections import namedtuple
@@ -370,6 +388,9 @@ class MultiscaleSpatialTrainerV2(TemporalMatryoshkaBatchTopKTrainer):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--data_path",    type=str, default=None)
+    p.add_argument("--hdf5_path",    type=str, default=None,
+        help="Path to NSD-style HDF5 with key 'imgBrick' (N,H,W,3) uint8.")
+    p.add_argument("--hdf5_key",     type=str, default="imgBrick")
     p.add_argument("--image_root",   type=str, default=None)
     p.add_argument("--image_column", type=str, default="image")
     p.add_argument("--dino_model",   type=str, default="dinov2_vitb14")
@@ -418,9 +439,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_every",  type=int, default=10000)
     p.add_argument("--init_from_ckpt", type=str, default=None)
 
+    p.add_argument("--log_every",    type=int, default=200,
+        help="Log per-group losses to CSV every N steps.")
+
     args = p.parse_args()
-    if args.data_path is None and args.image_root is None:
-        p.error("Provide --data_path or --image_root.")
+    if args.data_path is None and args.hdf5_path is None and args.image_root is None:
+        p.error("Provide --data_path, --hdf5_path, or --image_root.")
     return args
 
 
@@ -444,14 +468,17 @@ def main() -> None:
     print(f"  dict_size={args.dict_size}, k={args.k}, steps={args.steps}")
 
     parquet_path  = args.data_path
+    hdf5_path     = args.hdf5_path
     image_paths   = None
-    if args.data_path is None:
+    if args.data_path is None and args.hdf5_path is None:
         exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
         image_paths = [str(p) for p in Path(args.image_root).rglob("*")
                        if p.suffix.lower() in exts]
 
     buffer = MultiscalePatchPairBufferV2(
         parquet_path=parquet_path,
+        hdf5_path=hdf5_path,
+        hdf5_key=args.hdf5_key,
         image_paths=image_paths,
         image_column=args.image_column,
         dino_model_name=args.dino_model,
@@ -509,12 +536,34 @@ def main() -> None:
     with open(save_dir / "run_args.json", "w") as f:
         json.dump(vars(args) | {"activation_dim": activation_dim}, f, indent=2)
 
+    loss_csv_path = save_dir / "loss_log.csv"
+    csv_fields = ["step", "loss", "l2_loss", "loss_g0", "loss_g1", "loss_g2",
+                  "contrastive_loss", "auxk_loss"]
+    loss_records: list[dict] = []
+
+    # Open CSV and write header
+    with open(loss_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields)
+        writer.writeheader()
+
     step = 0
     while step < args.steps:
         for x in buffer:
             loss_val = trainer.update(step, x)
             if step % 100 == 0:
                 print(f"[step {step:>6}] loss={loss_val:.6f}")
+
+            # Log per-group losses every log_every steps
+            if step % args.log_every == 0 and hasattr(trainer, "_last_per_group_losses"):
+                row = {"step": step, **trainer._last_per_group_losses}
+                loss_records.append(row)
+                with open(loss_csv_path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=csv_fields)
+                    writer.writerow(row)
+                print(f"[step {step:>6}] loss_g0={row['loss_g0']:.4f} "
+                      f"loss_g1={row['loss_g1']:.4f} loss_g2={row['loss_g2']:.4f} "
+                      f"l2={row['l2_loss']:.4f}")
+
             if step > 0 and step % args.save_every == 0:
                 ckpt = save_dir / f"checkpoint_step_{step}.pt"
                 torch.save(trainer.ae.state_dict(), ckpt)
@@ -526,6 +575,7 @@ def main() -> None:
     final = save_dir / "ae_final.pt"
     torch.save(trainer.ae.state_dict(), final)
     print(f"Saved: {final}")
+    print(f"Loss log: {loss_csv_path} ({len(loss_records)} entries)")
 
 
 if __name__ == "__main__":

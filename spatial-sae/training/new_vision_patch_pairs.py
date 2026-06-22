@@ -62,6 +62,42 @@ class ImagePathDataset(Dataset):
         return _preprocess_pil(_open_image(self.image_paths[idx]), self.image_size)
 
 
+class NSDHdf5Dataset(Dataset):
+    """Read images from the NSD stimuli HDF5 file.
+
+    Expected dataset key layout: ``imgBrick`` with shape (N, H, W, 3) uint8.
+    The file is opened lazily per-worker so DataLoader multiprocessing works.
+    """
+
+    def __init__(
+        self,
+        hdf5_path: Union[str, Path],
+        image_size: int = 224,
+        key: str = "imgBrick",
+    ):
+        import h5py
+        self.hdf5_path = str(hdf5_path)
+        self.image_size = image_size
+        self.key = key
+        with h5py.File(self.hdf5_path, "r") as f:
+            self._len = f[self.key].shape[0]
+        self._h5file = None  # opened lazily inside worker
+
+    def __len__(self) -> int:
+        return self._len
+
+    def _file(self):
+        if self._h5file is None:
+            import h5py
+            self._h5file = h5py.File(self.hdf5_path, "r")
+        return self._h5file
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        arr = self._file()[self.key][idx]  # (H, W, 3) uint8
+        img = Image.fromarray(arr, mode="RGB")
+        return _preprocess_pil(img, self.image_size)
+
+
 class ParquetImageDataset(Dataset):
     """Read images from a parquet file.
 
