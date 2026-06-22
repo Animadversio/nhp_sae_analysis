@@ -178,7 +178,7 @@ class MultiscalePatchPairBufferV2:
               f"G2_neg=dist>={g2_neg_dist_min}), "
               f"n_slots={N_SLOTS}")
 
-    def __iter__(self) -> Iterator[torch.Tensor]:
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         for images in self.loader:
             tokens = self.extractor.patch_tokens(images)   # (B_img, N, D)
             bsz, n_patches, d_model = tokens.shape
@@ -187,6 +187,7 @@ class MultiscalePatchPairBufferV2:
             grid = tokens.view(bsz, side, side, d_model)
 
             pair_list: list[torch.Tensor] = []
+            img_idx_list: list[int] = []
 
             for b in range(bsz):
                 for _ in range(self.pairs_per_image):
@@ -224,9 +225,20 @@ class MultiscalePatchPairBufferV2:
                         grid[b, rr2n, cc2n],# slot 5: G2_neg (hard)
                     ], dim=0)               # (6, D)
                     pair_list.append(slots)
+                    img_idx_list.append(b)
 
             if pair_list:
-                yield torch.stack(pair_list, dim=0).to(self.device)  # (B, 6, D)
+                # Shuffle so pairs from different images are interleaved.
+                # This ensures G0 InfoNCE off-diagonal elements are cross-image negatives,
+                # not same-image patches grouped together.
+                perm = list(range(len(pair_list)))
+                random.shuffle(perm)
+                pair_list    = [pair_list[i]    for i in perm]
+                img_idx_list = [img_idx_list[i] for i in perm]
+
+                tokens_out  = torch.stack(pair_list, dim=0).to(self.device)  # (B, 6, D)
+                img_idx_out = torch.tensor(img_idx_list, device=self.device)  # (B,)
+                yield tokens_out, img_idx_out
 
 
 # ─── Trainer ───────────────────────────────────────────────────────────────────
@@ -234,7 +246,7 @@ class MultiscalePatchPairBufferV2:
 class MultiscaleSpatialTrainerV2(TemporalMatryoshkaBatchTopKTrainer):
     """
     Loss:
-      G0: standard InfoNCE (anchor vs G0_pos; cross-image negatives implicit)
+      G0: InfoNCE (anchor vs G0_pos; same-image pairs masked out of negative pool)
       G1: InfoNCE with explicit hard-neg (G1_neg concat'd to negative pool)
       G2: InfoNCE with explicit hard-neg (G2_neg concat'd to negative pool)
       G3: reconstruction only
@@ -246,9 +258,14 @@ class MultiscaleSpatialTrainerV2(TemporalMatryoshkaBatchTopKTrainer):
         kwargs["contrastive"] = False
         super().__init__(**kwargs)
 
-    def loss(self, x: torch.Tensor, step: int, logging: bool = False):
-        """x: (B, 6, D)"""
+    def loss(self, x, step: int, logging: bool = False):
+        """x: (B, 6, D) or tuple((B, 6, D), (B,) img_idx)"""
         import torch as t
+
+        if isinstance(x, (tuple, list)):
+            x, img_idx = x   # img_idx: (B,) int tensor, same value = same source image
+        else:
+            img_idx = None
 
         anchor  = x[:, 0]   # (B, D)
         g0_pos  = x[:, 1]
@@ -289,9 +306,15 @@ class MultiscaleSpatialTrainerV2(TemporalMatryoshkaBatchTopKTrainer):
             l2 = (anchor - x_hat).pow(2).sum(-1).mean() * self.group_weights[i]
             total_l2 = total_l2 + l2
 
-        # ── G0 InfoNCE: positive = G0_pos, negatives = cross-image (implicit) ─
-        # logits (B, B): diagonal = positive pair, off-diagonal = cross-image neg
+        # ── G0 InfoNCE: positive = G0_pos, negatives = cross-image only ─────
+        # logits (B, B): diagonal = positive pair, off-diagonal should be cross-image neg
         logits0 = f_chunks[0] @ f0_pos.T
+        if img_idx is not None:
+            # Mask out same-image off-diagonal entries so they are NOT treated as negatives.
+            # Two positions are same-image when img_idx[i] == img_idx[j] and i != j.
+            same_img_mask = img_idx.unsqueeze(1) == img_idx.unsqueeze(0)  # (B, B)
+            same_img_mask.fill_diagonal_(False)  # keep diagonal (positive pairs)
+            logits0 = logits0.masked_fill(same_img_mask, float('-inf'))
         lbl = t.arange(logits0.shape[0], device=self.device, dtype=t.long)
         loss_g0 = (F.cross_entropy(logits0, lbl) + F.cross_entropy(logits0.T, lbl)) / 2
 
@@ -450,7 +473,7 @@ def main() -> None:
         g2_neg_dist_min=args.g2_neg_dist_min,
     )
 
-    first_batch = next(iter(buffer))
+    first_batch, _ = next(iter(buffer))
     activation_dim = first_batch.shape[-1]
     print(f"activation_dim={activation_dim}, first_batch={tuple(first_batch.shape)}")
 
